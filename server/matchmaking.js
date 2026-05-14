@@ -1,4 +1,4 @@
-/** Casual queues keyed by gameMode; ranked is Classic 2-player only. */
+/** Casual queues keyed by gameMode (incl. wild); ranked is Classic 2-player only. */
 
 const ranked = [];
 /** @type {Map<string, Array<{ socketId: string, userId: string, username: string, rankedRating: number, gameMode?: string }>>} */

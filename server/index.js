@@ -423,15 +423,11 @@ io.on('connection', (socket) => {
       const rawMode = String(payload?.gameMode || 'classic').toLowerCase();
       const allowed = new Set(['classic', '2v2', 'ffa', 'wild']);
       const gameMode = allowed.has(rawMode) ? rawMode : 'classic';
-      if (gameMode === 'wild') {
-        socket.emit('toast', { type: 'error', message: 'WILD is not in matchmaking yet.' });
-        return;
-      }
       if (type === 'ranked' && gameMode !== 'classic') {
         socket.emit('toast', { type: 'error', message: 'Ranked is Classic 1v1 only.' });
         return;
       }
-      if (type === 'casual' && !['classic', '2v2', 'ffa'].includes(gameMode)) {
+      if (type === 'casual' && !['classic', '2v2', 'ffa', 'wild'].includes(gameMode)) {
         socket.emit('toast', { type: 'error', message: 'Unknown queue mode.' });
         return;
       }
