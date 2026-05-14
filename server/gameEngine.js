@@ -275,6 +275,8 @@ export function createRoom(hostId, opts = {}) {
     lastPulled: null,
     gameResult: null,
     playAgainVotes: {},
+    actionLog: [],
+    currentTurnLog: null,
     matchType: 'private',
     matchAccounts: null,
     rankedSettled: false,
@@ -307,6 +309,8 @@ export function startMatchFromLobby(room, opts = {}) {
   room.activeSeat = room.playerOrder[0];
   room.chessMoveOwners = [];
   room.lastCompletedChessTurn = { playerId: null, sanMoves: [], uciMoves: [] };
+  room.actionLog = [];
+  room.currentTurnLog = null;
   if (room.gameMode === 'ffa') {
     room.ffa = createFfaState();
     room.eliminated = new Set();
@@ -460,6 +464,7 @@ export function abortRevealIfDrawerLeft(room, socketId) {
 function activateDrawnCard(room, socketId, card) {
   if (room.activeSeat !== socketId) return { ok: false, error: 'Not your turn' };
   room.activeCard = card;
+  room.currentTurnLog = { playerId: socketId, card: serializeCard(card), chessMoves: [] };
 
   if (card.type === 'number') {
     room.movesRemaining = card.value;
@@ -536,6 +541,7 @@ function activateDrawnCard(room, socketId, card) {
 
 function finishTurnAfterCardEffects(room, socketId, playedCard) {
   if (!playedCard) return { ok: false, error: 'No active card' };
+  finalizeTurnLog(room);
   returnCardToBottom(room, playedCard);
   room.activeCard = null;
   room.movesRemaining = 0;
@@ -689,6 +695,7 @@ export function abandonMatch(room, socketId) {
   if (!room.playerOrder.includes(socketId)) return { ok: false, error: 'Not in room' };
 
   clearRevealForAbandon(room);
+  finalizeTurnLog(room);
   room.playAgainVotes = {};
   room.phase = 'gameover';
   room.bonus = null;
@@ -760,6 +767,8 @@ function resetMatch(room) {
   room.activeSeat = room.playerOrder[0] || null;
   room.shuffles = {};
   for (const pid of room.playerOrder) room.shuffles[pid] = 0;
+  room.actionLog = [];
+  room.currentTurnLog = null;
 }
 
 export function resolveBonus(room, socketId, payload) {
@@ -865,6 +874,7 @@ function makeFfaMove(room, socketId, { from, to, promotion }) {
   const next = ffaApplyMove(room.ffa, fr.r, fr.c, tc.r, tc.c, promotion);
   if (!next) return { ok: false, error: 'Illegal move' };
   room.ffa = next;
+  appendFfaChessMoveLine(room, p, fr.r, fr.c, tc.r, tc.c);
   if (capKing && victimArmy != null) {
     const vid = room.playerOrder[victimArmy];
     if (vid) room.eliminated.add(vid);
@@ -877,6 +887,7 @@ function makeFfaMove(room, socketId, { from, to, promotion }) {
     room.phase = 'gameover';
     room.gameResult = { kind: 'ffa_last_king', winnerId: wid, winnerArmy: wArmy };
     room.playAgainVotes = {};
+    finalizeTurnLog(room);
     const played = room.activeCard;
     if (played) returnCardToBottom(room, played);
     room.activeCard = null;
@@ -926,6 +937,7 @@ export function makeChessMove(room, socketId, payload) {
   const moverIsWhite = m.color === WHITE || m.color === 'w';
 
   room.movesRemaining--;
+  appendClassicChessMoveLine(room, m);
 
   if (m.captured === 'k') {
     room.phase = 'gameover';
@@ -989,6 +1001,43 @@ export function endChessMovesEarly(room, socketId) {
 
 function serializeCard(c) {
   return { id: c.id, type: c.type, value: c.value, color: c.color };
+}
+
+function finalizeTurnLog(room) {
+  if (!room.currentTurnLog) return;
+  if (!room.actionLog) room.actionLog = [];
+  const prevId = room.actionLog.length ? room.actionLog[room.actionLog.length - 1].id : 0;
+  room.actionLog.push({
+    id: prevId + 1,
+    playerId: room.currentTurnLog.playerId,
+    card: room.currentTurnLog.card,
+    chessMoves: [...room.currentTurnLog.chessMoves],
+  });
+  while (room.actionLog.length > 100) room.actionLog.shift();
+  room.currentTurnLog = null;
+}
+
+function appendClassicChessMoveLine(room, m) {
+  if (!room.currentTurnLog || !m) return;
+  const names = { p: 'Pawn', n: 'Knight', b: 'Bishop', r: 'Rook', q: 'Queen', k: 'King' };
+  const pt = String(m.piece || 'p').toLowerCase();
+  const piece = names[pt] || 'Piece';
+  let line = `${piece} ${m.from} to ${m.to}`;
+  if (m.promotion) {
+    const pr = String(m.promotion).toLowerCase();
+    line += ` (promotes to ${names[pr] || pr})`;
+  }
+  if (m.san) line += ` · ${m.san}`;
+  room.currentTurnLog.chessMoves.push({ line });
+}
+
+function appendFfaChessMoveLine(room, fromPiece, fr, fc, tr, tc) {
+  if (!room.currentTurnLog || !fromPiece) return;
+  const names = { p: 'Pawn', n: 'Knight', b: 'Bishop', r: 'Rook', q: 'Queen', k: 'King' };
+  const t = String(fromPiece.t || 'p').toLowerCase();
+  const piece = names[t] || 'Piece';
+  const line = `${piece} (${fr},${fc}) to (${tr},${tc})`;
+  room.currentTurnLog.chessMoves.push({ line });
 }
 
 function hostagesForPublic(room, viewerId) {
@@ -1092,6 +1141,15 @@ export function publicState(room, viewerId) {
     matchKind: room.matchType || 'private',
     gameMode: room.gameMode || 'classic',
     mySeat: room.playerOrder.indexOf(viewerId),
+    actionLog: (room.actionLog || []).slice(-60),
+    liveRound:
+      room.currentTurnLog && (room.phase === 'makingMoves' || room.phase === 'bonus')
+        ? {
+            playerId: room.currentTurnLog.playerId,
+            card: { ...room.currentTurnLog.card },
+            chessMoves: [...room.currentTurnLog.chessMoves],
+          }
+        : null,
   };
   return {
     ...base,

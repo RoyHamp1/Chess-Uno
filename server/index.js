@@ -88,6 +88,62 @@ function broadcastRoomWithRanked(room) {
   queueBotTurn(room.code);
 }
 
+function abandonKickMessage(room, pid) {
+  const gr = room.gameResult;
+  const fi = gr?.forfeitingId;
+  if (gr?.kind !== 'forfeit' || !fi) {
+    return 'Match ended — returned to lobby.';
+  }
+  if (pid === fi) return 'You abandoned the match — returned to lobby.';
+  if (
+    gr.winnerIds?.includes(pid) ||
+    gr.survivorIds?.includes(pid) ||
+    (room.playerOrder?.length === 2 && pid !== fi)
+  ) {
+    return 'Opponent abandoned — you win.';
+  }
+  return 'A teammate abandoned — returned to lobby.';
+}
+
+/** @returns {'win' | 'loss'} */
+function abandonKickOutcome(room, pid) {
+  const gr = room.gameResult;
+  const fi = gr?.forfeitingId;
+  if (gr?.kind !== 'forfeit' || !fi) return 'loss';
+  if (pid === fi) return 'loss';
+  if (
+    gr.winnerIds?.includes(pid) ||
+    gr.survivorIds?.includes(pid) ||
+    (room.playerOrder?.length === 2 && pid !== fi)
+  ) {
+    return 'win';
+  }
+  return 'loss';
+}
+
+/** After casual/private abandon with closeRoom: remove everyone from the room and return humans to lobby. */
+function disbandRoomAfterAbandon(io, room) {
+  if (!room || !rooms.has(room.code)) return;
+  const code = room.code;
+  const humans = room.playerOrder.filter((id) => !isBotPlayerId(id));
+  for (const pid of humans) {
+    const sk = io.sockets.sockets.get(pid);
+    if (!sk) continue;
+    sk.emit('kickedToLobby', {
+      reason: 'abandon',
+      outcome: abandonKickOutcome(room, pid),
+      message: abandonKickMessage(room, pid),
+    });
+    sk.leave(code);
+    socketRoom.delete(pid);
+  }
+  while (room.playerOrder.length) {
+    leaveRoom(room, room.playerOrder[0]);
+  }
+  clearRevealTimeout(room);
+  rooms.delete(code);
+}
+
 function queueBotTurn(code) {
   setTimeout(() => {
     try {
@@ -386,6 +442,22 @@ io.on('connection', (socket) => {
     broadcastRoomWithRanked(room);
   });
 
+  socket.on('leaveMatch', () => {
+    const code = socketRoom.get(socket.id);
+    if (!code) {
+      socket.emit('state', null);
+      socket.emit('roomCode', '');
+      return;
+    }
+    removeSocketFromRoom(socket);
+    const remaining = rooms.get(code);
+    if (remaining) {
+      broadcastRoomWithRanked(remaining);
+    }
+    socket.emit('state', null);
+    socket.emit('roomCode', '');
+  });
+
   socket.on('lobbySetReady', (payload) => {
     const code = socketRoom.get(socket.id);
     const room = code ? rooms.get(code) : null;
@@ -528,14 +600,21 @@ io.on('connection', (socket) => {
     broadcastRoomWithRanked(room);
   });
 
-  socket.on('abandonMatch', () => {
+  socket.on('abandonMatch', (payload) => {
     const code = socketRoom.get(socket.id);
     const room = code ? rooms.get(code) : null;
     if (!room) return;
     clearRevealTimeout(room);
     const r = abandonMatch(room, socket.id);
     if (!r.ok) socket.emit('toast', { type: 'error', message: r.error });
-    else broadcastRoomWithRanked(room);
+      else {
+        const closeRoom = !!payload?.closeRoom && room.matchType !== 'ranked';
+        if (closeRoom) {
+          disbandRoomAfterAbandon(io, room);
+        } else {
+          broadcastRoomWithRanked(room);
+        }
+      }
   });
 
   socket.on('playAgain', async () => {
