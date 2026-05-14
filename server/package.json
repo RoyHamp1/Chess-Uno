@@ -1,0 +1,19 @@
+{
+  "name": "chess-uno-server",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "db:migrate": "node migrate.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "chess.js": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^6.9.16",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
+  }
+}
