@@ -23,6 +23,7 @@ import {
   publicState,
   bonusHint,
   votePlayAgain,
+  abandonMatch,
   addLobbyBot,
   removeLobbyBot,
   setLobbyReady,
@@ -525,6 +526,16 @@ io.on('connection', (socket) => {
     if (!r.ok) socket.emit('toast', { type: 'error', message: r.error });
     else socket.emit('toast', { type: 'ok', message: 'Deck shuffled' });
     broadcastRoomWithRanked(room);
+  });
+
+  socket.on('abandonMatch', () => {
+    const code = socketRoom.get(socket.id);
+    const room = code ? rooms.get(code) : null;
+    if (!room) return;
+    clearRevealTimeout(room);
+    const r = abandonMatch(room, socket.id);
+    if (!r.ok) socket.emit('toast', { type: 'error', message: r.error });
+    else broadcastRoomWithRanked(room);
   });
 
   socket.on('playAgain', async () => {

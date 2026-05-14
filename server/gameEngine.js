@@ -674,6 +674,66 @@ export function votePlayAgain(room, socketId) {
   return { ok: true, restarted: true };
 }
 
+function clearRevealForAbandon(room) {
+  const p = room.pendingReveal;
+  if (!p) return;
+  room.deck.unshift(p.card);
+  room.pendingReveal = null;
+  room.lastPulled = null;
+}
+
+/** End the match immediately: abandoning player / their team loses (2v2); FFA others win. */
+export function abandonMatch(room, socketId) {
+  if (room.phase === 'lobby') return { ok: false, error: 'Not in a match' };
+  if (room.phase === 'gameover') return { ok: false, error: 'Game already over' };
+  if (!room.playerOrder.includes(socketId)) return { ok: false, error: 'Not in room' };
+
+  clearRevealForAbandon(room);
+  room.playAgainVotes = {};
+  room.phase = 'gameover';
+  room.bonus = null;
+  room.activeCard = null;
+  room.movesRemaining = 0;
+  room.skipNextFor = null;
+
+  const n = room.playerOrder.length;
+  const gm = room.gameMode;
+
+  if (isTwoPlayerChess(room) && n === 2) {
+    const opp = opponentId(room, socketId);
+    room.gameResult = { kind: 'forfeit', winnerId: opp, forfeitingId: socketId };
+    return { ok: true, gameover: true };
+  }
+
+  if (gm === '2v2' && n === 4) {
+    const myColor = colorOfSeat(room, socketId);
+    if (myColor !== 'w' && myColor !== 'b') return { ok: false, error: 'Cannot abandon this seat' };
+    const winColor = myColor === 'w' ? 'b' : 'w';
+    const ids = socketIdsForTeamColor(room, winColor);
+    room.gameResult = {
+      kind: 'forfeit',
+      winnerId: ids[0] ?? null,
+      winnerIds: ids,
+      forfeitingId: socketId,
+    };
+    return { ok: true, gameover: true };
+  }
+
+  if (gm === 'ffa' && n === 4) {
+    const survivors = room.playerOrder.filter((id) => id !== socketId);
+    const winnerId = survivors[0] ?? null;
+    room.gameResult = {
+      kind: 'forfeit',
+      winnerId,
+      forfeitingId: socketId,
+      survivorIds: survivors,
+    };
+    return { ok: true, gameover: true };
+  }
+
+  return { ok: false, error: 'Cannot abandon this match type' };
+}
+
 function resetMatch(room) {
   room.turnDirection = 1;
   if (room.gameMode === 'ffa') {

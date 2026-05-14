@@ -9,7 +9,7 @@ export async function applyRankedIfGameover(io, room) {
   if (!room || room.matchType !== 'ranked' || room.phase !== 'gameover' || room.rankedSettled) return;
   const gr = room.gameResult;
   if (!gr?.winnerId) return;
-  if (gr.kind !== 'checkmate' && gr.kind !== 'king_captured') return;
+  if (gr.kind !== 'checkmate' && gr.kind !== 'king_captured' && gr.kind !== 'forfeit') return;
   if (!room.matchAccounts) return;
 
   const loserPid = room.playerOrder.find((id) => id !== gr.winnerId);
