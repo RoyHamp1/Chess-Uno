@@ -18,9 +18,74 @@ export function ffaInPlayablePlus(r, c) {
   return !ffaIsHole(r, c);
 }
 
-/** Hub of the cross (8×8 center): pawns get lateral / forward choice here. */
+/** Hub of the cross (rows 5–12, cols E–L): pawns get special movement here. */
 export function ffaInMiddle(r, c) {
   return r >= 4 && r <= 11 && c >= 4 && c <= 11;
+}
+
+const CARDINAL_DIRS = [
+  [-1, 0],
+  [1, 0],
+  [0, -1],
+  [0, 1],
+];
+
+const DIAGONAL_DIRS = [
+  [-1, -1],
+  [-1, 1],
+  [1, -1],
+  [1, 1],
+];
+
+/** 2v2 hub: cannot step back toward home arm (black↓, grey↑, white←, beige→). */
+const HUB_FORBIDDEN_STEP_2V2 = [
+  [1, 0],
+  [-1, 0],
+  [0, -1],
+  [0, 1],
+];
+
+function dirEq(a, b) {
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+function pawnHubStepDirs2v2(army) {
+  const forbid = HUB_FORBIDDEN_STEP_2V2[army];
+  return CARDINAL_DIRS.filter((d) => !dirEq(d, forbid));
+}
+
+function pawnHubCaptureDirs2v2(army) {
+  const forbid = HUB_FORBIDDEN_STEP_2V2[army];
+  return DIAGONAL_DIRS.filter(([dr, dc]) => {
+    if (forbid[0] !== 0 && dr === forbid[0]) return false;
+    if (forbid[1] !== 0 && dc === forbid[1]) return false;
+    return true;
+  });
+}
+
+/** FFA: even vs odd armies. 2v2: P1+P2 (armies 0–1, south/north) vs P3+P4 (armies 2–3, west/east). */
+export function armyTeam(army, teamMode = 'ffa') {
+  if (teamMode === '2v2') return army < 2 ? 0 : 1;
+  return army % 2;
+}
+
+function canCaptureArmy(attacker, targetArmy, teamMode) {
+  if (targetArmy === attacker) return false;
+  if (!teamMode) return targetArmy !== attacker;
+  return armyTeam(targetArmy, teamMode) !== armyTeam(attacker, teamMode);
+}
+
+export function forwardForArmy(army, teamMode = 'ffa') {
+  if (teamMode === '2v2') {
+    const v = [
+      [-1, 0],
+      [1, 0],
+      [0, 1],
+      [0, -1],
+    ];
+    return v[army] ?? ARMY_FORWARD[army];
+  }
+  return ARMY_FORWARD[army];
 }
 
 /** Unit forward vectors (toward board center) for each army. */
@@ -52,31 +117,38 @@ function rot90(dr, dc) {
   return [-dc, dr];
 }
 
-function pawnStepDirs(state, r, c, army) {
-  const F = ARMY_FORWARD[army];
-  const L = rot90(F[0], F[1]);
-  const Rdir = rot90(L[0], L[1]);
+function pawnStepDirs(state, r, c, army, teamMode = 'ffa') {
   const meta = state.pawnMeta[keyRC(r, c)];
   if (meta?.lock) {
     return [meta.lock];
   }
+  if (ffaInMiddle(r, c) && teamMode === '2v2') {
+    return pawnHubStepDirs2v2(army);
+  }
+  const F = forwardForArmy(army, teamMode);
+  const L = rot90(F[0], F[1]);
+  const Rdir = rot90(L[0], L[1]);
   if (ffaInMiddle(r, c)) {
     return [F, L, Rdir];
   }
   return [F];
 }
 
-function pawnCaptureDirs(state, r, c, army) {
-  const F = ARMY_FORWARD[army];
-  const L = rot90(F[0], F[1]);
-  const Rdir = rot90(L[0], L[1]);
+function pawnCaptureDirs(state, r, c, army, teamMode = 'ffa') {
   const meta = state.pawnMeta[keyRC(r, c)];
   if (meta?.lock) {
-    const d = meta.lock;
+    const F = meta.lock;
+    const L = rot90(F[0], F[1]);
     return [
-      [d[0] + L[0], d[1] + L[1]],
-      [d[0] + Rdir[0], d[1] + Rdir[1]],
+      [F[0] + L[0], F[1] + L[1]],
+      [F[0] - L[0], F[1] - L[1]],
     ];
+  }
+  const F = forwardForArmy(army, teamMode);
+  const L = rot90(F[0], F[1]);
+  const Rdir = rot90(L[0], L[1]);
+  if (ffaInMiddle(r, c) && teamMode === '2v2') {
+    return pawnHubCaptureDirs2v2(army);
   }
   return [
     [F[0] + L[0], F[1] + L[1]],
@@ -84,7 +156,7 @@ function pawnCaptureDirs(state, r, c, army) {
   ];
 }
 
-function addRay(board, army, r, c, dr, dc, out, captureOnly) {
+function addRay(board, army, r, c, dr, dc, out, captureOnly, teamsMode) {
   let nr = r + dr;
   let nc = c + dc;
   while (ffaInPlayablePlus(nr, nc)) {
@@ -95,12 +167,12 @@ function addRay(board, army, r, c, dr, dc, out, captureOnly) {
       nc += dc;
       continue;
     }
-    if (t.a !== army) out.push([nr, nc]);
+    if (canCaptureArmy(army, t.a, teamsMode)) out.push([nr, nc]);
     break;
   }
 }
 
-function addKnight(board, army, r, c, out) {
+function addKnight(board, army, r, c, out, teamsMode) {
   const deltas = [
     [2, 1],
     [2, -1],
@@ -116,11 +188,11 @@ function addKnight(board, army, r, c, out) {
     const nc = c + dc;
     if (!ffaInPlayablePlus(nr, nc)) continue;
     const t = cellAt(board, nr, nc);
-    if (!t || t.a !== army) out.push([nr, nc]);
+    if (!t || canCaptureArmy(army, t.a, teamsMode)) out.push([nr, nc]);
   }
 }
 
-function addKing(board, army, r, c, out) {
+function addKing(board, army, r, c, out, teamsMode) {
   for (let dr = -1; dr <= 1; dr++) {
     for (let dc = -1; dc <= 1; dc++) {
       if (dr === 0 && dc === 0) continue;
@@ -128,12 +200,12 @@ function addKing(board, army, r, c, out) {
       const nc = c + dc;
       if (!ffaInPlayablePlus(nr, nc)) continue;
       const t = cellAt(board, nr, nc);
-      if (!t || t.a !== army) out.push([nr, nc]);
+      if (!t || canCaptureArmy(army, t.a, teamsMode)) out.push([nr, nc]);
     }
   }
 }
 
-function collectPseudoMovesFull(state, r, c, p, out, attacksOnly) {
+function collectPseudoMovesFull(state, r, c, p, out, attacksOnly, teamMode = false) {
   const board = state.board;
   const army = p.a;
   const t = p.t.toLowerCase();
@@ -144,7 +216,7 @@ function collectPseudoMovesFull(state, r, c, p, out, attacksOnly) {
       [0, 1],
       [0, -1],
     ]) {
-      addRay(board, army, r, c, dr, dc, out, attacksOnly);
+      addRay(board, army, r, c, dr, dc, out, attacksOnly, teamMode);
     }
     return;
   }
@@ -155,7 +227,7 @@ function collectPseudoMovesFull(state, r, c, p, out, attacksOnly) {
       [-1, 1],
       [-1, -1],
     ]) {
-      addRay(board, army, r, c, dr, dc, out, attacksOnly);
+      addRay(board, army, r, c, dr, dc, out, attacksOnly, teamMode);
     }
     return;
   }
@@ -170,21 +242,22 @@ function collectPseudoMovesFull(state, r, c, p, out, attacksOnly) {
       [-1, 1],
       [-1, -1],
     ]) {
-      addRay(board, army, r, c, dr, dc, out, attacksOnly);
+      addRay(board, army, r, c, dr, dc, out, attacksOnly, teamMode);
     }
     return;
   }
   if (t === 'n') {
-    addKnight(board, army, r, c, out);
+    addKnight(board, army, r, c, out, teamMode);
     return;
   }
   if (t === 'k') {
-    addKing(board, army, r, c, out);
+    addKing(board, army, r, c, out, teamMode);
     return;
   }
   if (t === 'p') {
+    const pawnMode = teamMode || 'ffa';
     if (!attacksOnly) {
-      const steps = pawnStepDirs(state, r, c, army);
+      const steps = pawnStepDirs(state, r, c, army, pawnMode);
       for (const [dr, dc] of steps) {
         const nr = r + dr;
         const nc = c + dc;
@@ -193,13 +266,13 @@ function collectPseudoMovesFull(state, r, c, p, out, attacksOnly) {
         if (!occ) out.push([nr, nc]);
       }
     }
-    const caps = pawnCaptureDirs(state, r, c, army);
+    const caps = pawnCaptureDirs(state, r, c, army, pawnMode);
     for (const [dr, dc] of caps) {
       const nr = r + dr;
       const nc = c + dc;
       if (!ffaInPlayablePlus(nr, nc)) continue;
       const occ = cellAt(board, nr, nc);
-      if (occ && occ.a !== army) out.push([nr, nc]);
+      if (occ && canCaptureArmy(army, occ.a, teamMode)) out.push([nr, nc]);
     }
   }
 }
@@ -235,7 +308,7 @@ export function cloneFfaState(state) {
   };
 }
 
-function squaresAttackedByArmy(state, army) {
+function squaresAttackedByArmy(state, army, teamMode = false) {
   const attacked = new Set();
   const board = state.board;
   for (let r = 0; r < FFA_H; r++) {
@@ -244,20 +317,21 @@ function squaresAttackedByArmy(state, army) {
       const p = cellAt(board, r, c);
       if (!p || p.a !== army) continue;
       const raw = [];
-      collectPseudoMovesFull(state, r, c, p, raw, p.t.toLowerCase() === 'p');
+      collectPseudoMovesFull(state, r, c, p, raw, p.t.toLowerCase() === 'p', teamMode);
       for (const [tr, tc] of raw) attacked.add(keyRC(tr, tc));
     }
   }
   return attacked;
 }
 
-export function ffaLegalMoves(state, fr, fc) {
+export function ffaLegalMoves(state, fr, fc, teamMode = false) {
   const p = cellAt(state.board, fr, fc);
   if (!p) return [];
   const raw = [];
-  collectPseudoMovesFull(state, fr, fc, p, raw, false);
+  collectPseudoMovesFull(state, fr, fc, p, raw, false, teamMode);
   const out = [];
   const army = p.a;
+  const promoMode = teamMode === '2v2' ? '2v2' : 'ffa';
   for (const [tr, tc] of raw) {
     const test = cloneFfaState(state);
     const i0 = idx(fr, fc);
@@ -265,7 +339,7 @@ export function ffaLegalMoves(state, fr, fc) {
     test.board[i1] = { ...p };
     test.board[i0] = null;
     if (p.t.toLowerCase() === 'p') {
-      const pr = ffaPawnReachesPromotionEdge(army, tr, tc) ? 'q' : null;
+      const pr = ffaPawnReachesPromotionEdge(army, tr, tc, promoMode) ? 'q' : null;
       if (pr) test.board[i1].t = 'Q';
     }
     const ks = kingSquareOf(test.board, army);
@@ -276,7 +350,8 @@ export function ffaLegalMoves(state, fr, fc) {
     let safe = true;
     for (let a = 0; a < 4; a++) {
       if (a === army) continue;
-      const atk = squaresAttackedByArmy(test, a);
+      if (teamMode && armyTeam(a, teamMode) === armyTeam(army, teamMode)) continue;
+      const atk = squaresAttackedByArmy(test, a, teamMode);
       if (atk.has(keyRC(ks[0], ks[1]))) {
         safe = false;
         break;
@@ -287,7 +362,14 @@ export function ffaLegalMoves(state, fr, fc) {
   return out;
 }
 
-export function ffaPawnReachesPromotionEdge(army, tr, tc) {
+export function ffaPawnReachesPromotionEdge(army, tr, tc, teamMode = 'ffa') {
+  if (teamMode === '2v2') {
+    if (army === 0) return tr === 0;
+    if (army === 1) return tr === FFA_H - 1;
+    if (army === 2) return tc === FFA_W - 1;
+    if (army === 3) return tc === 0;
+    return false;
+  }
   if (army === 0) return tr === 0;
   if (army === 2) return tr === FFA_H - 1;
   if (army === 1) return tc === 0;
@@ -295,9 +377,26 @@ export function ffaPawnReachesPromotionEdge(army, tr, tc) {
   return false;
 }
 
+export function teamHasLivingKing(board, team, teamMode = '2v2') {
+  for (let a = 0; a < 4; a++) {
+    if (armyTeam(a, teamMode) !== team) continue;
+    if (kingSquareOf(board, a)) return true;
+  }
+  return false;
+}
+
+/** @returns {null | 0 | 1} winning team when one side has no kings left */
+export function ffaWinningTeam2v2(board) {
+  const t0 = teamHasLivingKing(board, 0, '2v2');
+  const t1 = teamHasLivingKing(board, 1, '2v2');
+  if (t0 && t1) return null;
+  if (!t0 && !t1) return null;
+  return t0 ? 0 : 1;
+}
+
 /** Apply move; returns new state or null if illegal. */
-export function ffaApplyMove(state, fr, fc, tr, tc, promotion) {
-  const moves = ffaLegalMoves(state, fr, fc);
+export function ffaApplyMove(state, fr, fc, tr, tc, promotion, teamMode = false) {
+  const moves = ffaLegalMoves(state, fr, fc, teamMode);
   if (!moves.some(([r2, c2]) => r2 === tr && c2 === tc)) return null;
   const next = cloneFfaState(state);
   const i0 = idx(fr, fc);
@@ -307,7 +406,8 @@ export function ffaApplyMove(state, fr, fc, tr, tc, promotion) {
   next.board[i1] = { ...piece };
   next.board[i0] = null;
 
-  if (piece.t.toLowerCase() === 'p' && ffaPawnReachesPromotionEdge(piece.a, tr, tc)) {
+  const promoMode = teamMode === '2v2' ? '2v2' : 'ffa';
+  if (piece.t.toLowerCase() === 'p' && ffaPawnReachesPromotionEdge(piece.a, tr, tc, promoMode)) {
     const pr = (promotion || 'q').toLowerCase().slice(0, 1);
     if ('qrbn'.includes(pr)) next.board[i1].t = pr === 'n' ? 'N' : pr.toUpperCase();
   }
@@ -318,7 +418,9 @@ export function ffaApplyMove(state, fr, fc, tr, tc, promotion) {
     const wasMid = ffaInMiddle(fr, fc);
     const nowMid = ffaInMiddle(tr, tc);
     let lock = null;
-    if (wasMid && !nowMid) {
+    if (teamMode === '2v2' && nowMid) {
+      lock = null;
+    } else if (wasMid && !nowMid) {
       lock = [Math.sign(tr - fr) || 0, Math.sign(tc - fc) || 0];
       if (lock[0] === 0 && lock[1] === 0) lock = null;
     } else if (!wasMid) {
@@ -368,6 +470,16 @@ export function createFfaState() {
   fillStandardBlock(board, 2, 'n');
   fillStandardBlock(board, 1, 'e');
   fillStandardBlock(board, 3, 'w');
+  return { board, pawnMeta: {} };
+}
+
+/** 2v2: P1 black south, P2 grey north, P3 white west, P4 beige east (seat index = army). */
+export function create2v2State() {
+  const board = Array(FFA_W * FFA_H).fill(null);
+  fillStandardBlock(board, 0, 's');
+  fillStandardBlock(board, 1, 'n');
+  fillStandardBlock(board, 2, 'w');
+  fillStandardBlock(board, 3, 'e');
   return { board, pawnMeta: {} };
 }
 

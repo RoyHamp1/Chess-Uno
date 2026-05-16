@@ -2,13 +2,43 @@ import { randomUUID } from 'node:crypto';
 import { Chess, WHITE, BLACK, PAWN, KING, SQUARES } from 'chess.js';
 import {
   createFfaState,
+  create2v2State,
   ffaApplyMove,
   ffaWinnerArmy,
+  ffaWinningTeam2v2,
+  armyTeam,
   serializeFfaBoard,
   ffaIsHole,
   FFA_W,
   FFA_H,
 } from './ffaEngine.js';
+
+function isPlusChessMode(room) {
+  return room.gameMode === 'ffa' || room.gameMode === '2v2';
+}
+
+function plusTeamMode(room) {
+  if (room.gameMode === '2v2') return '2v2';
+  if (room.gameMode === 'ffa') return 'ffa';
+  return false;
+}
+
+function createPlusState(room) {
+  return room.gameMode === '2v2' ? create2v2State() : createFfaState();
+}
+
+function resolve2v2TeamWin(room) {
+  const winTeam = ffaWinningTeam2v2(room.ffa.board);
+  if (winTeam == null) return null;
+  const armies = winTeam === 0 ? [0, 1] : [2, 3];
+  const winnerIds = armies.map((a) => room.playerOrder[a]).filter(Boolean);
+  return {
+    kind: '2v2_team',
+    winnerTeam: winTeam,
+    winnerId: winnerIds[0] ?? null,
+    winnerIds,
+  };
+}
 
 const PIECE_TYPES = new Set(['p', 'n', 'b', 'r', 'q', 'k']);
 
@@ -130,8 +160,7 @@ function colorOfSeat(room, socketId) {
   const idx = room.playerOrder.indexOf(socketId);
   if (idx === -1) return null;
   if (isTwoPlayerChess(room)) return idx === 0 ? 'w' : 'b';
-  if (room.gameMode === '2v2') return idx % 2 === 0 ? 'b' : 'w';
-  if (room.gameMode === 'ffa') return ['w', 'u', 'b', 'r'][idx] ?? null;
+  if (room.gameMode === '2v2' || room.gameMode === 'ffa') return String(idx);
   return idx === 0 ? 'w' : 'b';
 }
 
@@ -171,7 +200,8 @@ function socketIdForChessColor(room, colorChar) {
 
 function socketIdsForTeamColor(room, colorChar) {
   if (room.gameMode === '2v2') {
-    return room.playerOrder.filter((_, i) => (i % 2 === 0 ? 'b' : 'w') === colorChar);
+    const team = colorChar === 'w' || colorChar === '1' ? 1 : 0;
+    return room.playerOrder.filter((_, i) => armyTeam(i, '2v2') === team);
   }
   const one = socketIdForChessColor(room, colorChar);
   return one ? [one] : [];
@@ -311,8 +341,8 @@ export function startMatchFromLobby(room, opts = {}) {
   room.lastCompletedChessTurn = { playerId: null, sanMoves: [], uciMoves: [] };
   room.actionLog = [];
   room.currentTurnLog = null;
-  if (room.gameMode === 'ffa') {
-    room.ffa = createFfaState();
+  if (isPlusChessMode(room)) {
+    room.ffa = createPlusState(room);
     room.eliminated = new Set();
   } else {
     room.eliminated = null;
@@ -469,7 +499,7 @@ function activateDrawnCard(room, socketId, card) {
   if (card.type === 'number') {
     room.movesRemaining = card.value;
     room.phase = 'makingMoves';
-    if (room.gameMode === 'ffa') {
+    if (isPlusChessMode(room)) {
       if (room.movesRemaining === 0) {
         return finishTurnAfterCardEffects(room, socketId, card);
       }
@@ -523,7 +553,7 @@ function activateDrawnCard(room, socketId, card) {
   }
 
   if (card.type === 'draw2' || card.type === 'draw4') {
-    if (room.gameMode === 'ffa') {
+    if (isPlusChessMode(room)) {
       return finishTurnAfterCardEffects(room, socketId, card);
     }
     if (allHomeRanksOccupied(room, socketId)) {
@@ -581,6 +611,14 @@ function finishTurnAfterCardEffects(room, socketId, playedCard) {
       room.playAgainVotes = {};
       return { ok: true, gameover: true };
     }
+  } else if (room.gameMode === '2v2') {
+    const gr = resolve2v2TeamWin(room);
+    if (gr) {
+      room.phase = 'gameover';
+      room.gameResult = gr;
+      room.playAgainVotes = {};
+      return { ok: true, gameover: true };
+    }
   } else if (chessGameShouldEnd(room)) {
     room.phase = 'gameover';
     room.gameResult = computeGameResult(room);
@@ -588,7 +626,7 @@ function finishTurnAfterCardEffects(room, socketId, playedCard) {
     return { ok: true, gameover: true };
   }
 
-  if (room.gameMode !== 'ffa' && room.activeSeat) {
+  if (!isPlusChessMode(room) && room.activeSeat) {
     const need = chessColor(room, room.activeSeat);
     if (room.chess.turn() !== need) {
       const p = room.chess.fen().split(' ');
@@ -713,10 +751,10 @@ export function abandonMatch(room, socketId) {
   }
 
   if (gm === '2v2' && n === 4) {
-    const myColor = colorOfSeat(room, socketId);
-    if (myColor !== 'w' && myColor !== 'b') return { ok: false, error: 'Cannot abandon this seat' };
-    const winColor = myColor === 'w' ? 'b' : 'w';
-    const ids = socketIdsForTeamColor(room, winColor);
+    const army = room.playerOrder.indexOf(socketId);
+    if (army === -1) return { ok: false, error: 'Cannot abandon this seat' };
+    const winTeam = armyTeam(army, '2v2') === 0 ? 1 : 0;
+    const ids = room.playerOrder.filter((_, i) => armyTeam(i, '2v2') === winTeam);
     room.gameResult = {
       kind: 'forfeit',
       winnerId: ids[0] ?? null,
@@ -743,8 +781,8 @@ export function abandonMatch(room, socketId) {
 
 function resetMatch(room) {
   room.turnDirection = 1;
-  if (room.gameMode === 'ffa') {
-    room.ffa = createFfaState();
+  if (isPlusChessMode(room)) {
+    room.ffa = createPlusState(room);
     room.eliminated = new Set();
   } else {
     room.chess = new Chess();
@@ -871,7 +909,8 @@ function makeFfaMove(room, socketId, { from, to, promotion }) {
   const target = room.ffa.board[tc.r * FFA_W + tc.c];
   const capKing = target && target.t.toLowerCase() === 'k';
   const victimArmy = capKing ? target.a : null;
-  const next = ffaApplyMove(room.ffa, fr.r, fr.c, tc.r, tc.c, promotion);
+  const teamMode = plusTeamMode(room);
+  const next = ffaApplyMove(room.ffa, fr.r, fr.c, tc.r, tc.c, promotion, teamMode);
   if (!next) return { ok: false, error: 'Illegal move' };
   room.ffa = next;
   appendFfaChessMoveLine(room, p, fr.r, fr.c, tc.r, tc.c);
@@ -881,17 +920,31 @@ function makeFfaMove(room, socketId, { from, to, promotion }) {
   }
   room.chessMoveOwners.push(socketId);
   room.movesRemaining--;
-  const wArmy = ffaWinnerArmy(room.ffa.board);
-  if (wArmy != null) {
-    const wid = room.playerOrder[wArmy];
-    room.phase = 'gameover';
-    room.gameResult = { kind: 'ffa_last_king', winnerId: wid, winnerArmy: wArmy };
-    room.playAgainVotes = {};
-    finalizeTurnLog(room);
-    const played = room.activeCard;
-    if (played) returnCardToBottom(room, played);
-    room.activeCard = null;
-    return { ok: true, gameover: true };
+  if (room.gameMode === '2v2') {
+    const gr = resolve2v2TeamWin(room);
+    if (gr) {
+      room.phase = 'gameover';
+      room.gameResult = gr;
+      room.playAgainVotes = {};
+      finalizeTurnLog(room);
+      const played = room.activeCard;
+      if (played) returnCardToBottom(room, played);
+      room.activeCard = null;
+      return { ok: true, gameover: true };
+    }
+  } else {
+    const wArmy = ffaWinnerArmy(room.ffa.board);
+    if (wArmy != null) {
+      const wid = room.playerOrder[wArmy];
+      room.phase = 'gameover';
+      room.gameResult = { kind: 'ffa_last_king', winnerId: wid, winnerArmy: wArmy };
+      room.playAgainVotes = {};
+      finalizeTurnLog(room);
+      const played = room.activeCard;
+      if (played) returnCardToBottom(room, played);
+      room.activeCard = null;
+      return { ok: true, gameover: true };
+    }
   }
   if (room.movesRemaining > 0) return { ok: true };
   room.lastCompletedChessTurn = { playerId: socketId, sanMoves: [], uciMoves: [] };
@@ -899,7 +952,7 @@ function makeFfaMove(room, socketId, { from, to, promotion }) {
 }
 
 export function makeChessMove(room, socketId, payload) {
-  if (room.gameMode === 'ffa') {
+  if (isPlusChessMode(room)) {
     return makeFfaMove(room, socketId, payload);
   }
   const { from, to, promotion } = payload;
@@ -989,7 +1042,7 @@ export function makeChessMove(room, socketId, payload) {
 export function endChessMovesEarly(room, socketId) {
   if (room.phase !== 'makingMoves') return { ok: false, error: 'Not in move phase' };
   if (room.activeSeat !== socketId) return { ok: false, error: 'Not your turn' };
-  if (room.gameMode === 'ffa') {
+  if (isPlusChessMode(room)) {
     room.movesRemaining = 0;
     return finishTurnAfterCardEffects(room, socketId, room.activeCard);
   }
@@ -1066,6 +1119,7 @@ export function publicState(room, viewerId) {
       }
     : null;
   const isFfa = room.gameMode === 'ffa';
+  const isPlus = isPlusChessMode(room);
   const maxP = maxPlayers(room);
   let lobby = null;
   if (room.phase === 'lobby') {
@@ -1109,19 +1163,22 @@ export function publicState(room, viewerId) {
     phase: room.phase,
     revealing,
     lobby,
-    fen: isFfa ? null : room.chess.fen(),
-    ffa: isFfa && room.ffa ? serializeFfaBoard(room.ffa) : null,
+    fen: isPlus ? null : room.chess.fen(),
+    ffa: isPlus && room.ffa ? serializeFfaBoard(room.ffa) : null,
     activeSeat: room.activeSeat,
     movesRemaining: room.movesRemaining,
     playerOrder: [...room.playerOrder],
     deckSize: room.deck.length,
     turnDirection: room.turnDirection ?? 1,
     eliminatedIds: room.eliminated ? [...room.eliminated] : [],
-    turnColor: isFfa ? null : room.chess.turn(),
-    isCheck: isFfa ? false : room.chess.isCheck(),
-    isCheckmate: isFfa ? false : room.chess.isCheckmate(),
-    isDraw: isFfa ? false : room.chess.isDraw(),
-    gameOver: room.phase === 'gameover' || (!isFfa && chessGameShouldEnd(room)),
+    turnColor: isPlus ? null : room.chess.turn(),
+    isCheck: isPlus ? false : room.chess.isCheck(),
+    isCheckmate: isPlus ? false : room.chess.isCheckmate(),
+    isDraw: isPlus ? false : room.chess.isDraw(),
+    gameOver:
+      room.phase === 'gameover' ||
+      (room.gameMode === '2v2' && room.ffa && ffaWinningTeam2v2(room.ffa.board) != null) ||
+      (!isPlus && chessGameShouldEnd(room)),
     bonus: room.bonus
       ? {
           forPlayer: room.bonus.playerId,

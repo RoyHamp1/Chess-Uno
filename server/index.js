@@ -181,10 +181,18 @@ function drainBotTurns(code) {
 
     if (room.phase === 'makingMoves') {
       const diff = room.botProfile[cur]?.difficulty || 'medium';
-      if (room.gameMode === 'ffa') {
+      if (room.gameMode === 'ffa' || room.gameMode === '2v2') {
         const st = { board: [...room.ffa.board], pawnMeta: { ...room.ffa.pawnMeta } };
         const army = room.playerOrder.indexOf(cur);
-        const mv = pickFfaMove(ffaLegalMoves, st, army, FFA_W, FFA_H, diff);
+        const teamMode = room.gameMode === '2v2' ? '2v2' : 'ffa';
+        const mv = pickFfaMove(
+          (s, fr, fc) => ffaLegalMoves(s, fr, fc, teamMode),
+          st,
+          army,
+          FFA_W,
+          FFA_H,
+          diff,
+        );
         if (!mv) break;
         const [tr, tc] = mv.to.split(',').map(Number);
         const [fr, fc] = mv.from.split(',').map(Number);
