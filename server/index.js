@@ -83,6 +83,12 @@ function broadcastRoomWithRankedNoBot(room) {
   void applyRankedIfGameover(io, room).catch((err) => console.error('ranked settle', err));
 }
 
+function trackPlayerDisplayName(room, socket) {
+  if (!room || isBotPlayerId(socket.id)) return;
+  if (!room.displayNames) room.displayNames = Object.create(null);
+  room.displayNames[socket.id] = socket.data.username || 'Player';
+}
+
 function broadcastRoomWithRanked(room) {
   broadcastRoomWithRankedNoBot(room);
   queueBotTurn(room.code);
@@ -419,6 +425,7 @@ io.on('connection', (socket) => {
     const rawGm = String(payload?.gameMode || 'classic').toLowerCase();
     const pick = ['classic', '2v2', 'ffa', 'wild'].includes(rawGm) ? rawGm : 'classic';
     const room = createRoom(socket.id, { gameMode: pick });
+    trackPlayerDisplayName(room, socket);
     rooms.set(room.code, room);
     socket.join(room.code);
     socketRoom.set(socket.id, room.code);
@@ -445,6 +452,7 @@ io.on('connection', (socket) => {
       socket.emit('toast', { type: 'error', message: res.error });
       return;
     }
+    trackPlayerDisplayName(room, socket);
     socket.join(room.code);
     socketRoom.set(socket.id, room.code);
     broadcastRoomWithRanked(room);

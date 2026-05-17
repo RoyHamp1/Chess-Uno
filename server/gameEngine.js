@@ -280,6 +280,49 @@ function pieceFromCapturedEntry(entry) {
   return { type: entry.type, color: entry.color === 'w' ? WHITE : BLACK };
 }
 
+function resolvePlayerDisplayName(room, pid, viewerId, seatIndex) {
+  if (!pid) return '—';
+  if (pid === viewerId) return 'You';
+  if (isBotPlayerId(pid)) return room.botProfile?.[pid]?.name || `Bot ${seatIndex + 1}`;
+  const acc = room.matchAccounts?.[pid];
+  if (acc?.username) return acc.username;
+  if (room.displayNames?.[pid]) return room.displayNames[pid];
+  return `Player ${seatIndex + 1}`;
+}
+
+const PLUS_SEAT_SIDES_2V2 = [
+  { side: 'south', army: 0, colorName: 'Black' },
+  { side: 'north', army: 1, colorName: 'Dark grey' },
+  { side: 'west', army: 2, colorName: 'White' },
+  { side: 'east', army: 3, colorName: 'Beige' },
+];
+
+const PLUS_SEAT_SIDES_FFA = [
+  { side: 'south', army: 0, colorName: 'South / White' },
+  { side: 'east', army: 1, colorName: 'East / Blue' },
+  { side: 'north', army: 2, colorName: 'North / Black' },
+  { side: 'west', army: 3, colorName: 'West / Red' },
+];
+
+function buildPlusSeats(room, viewerId) {
+  if (!isPlusChessMode(room)) return null;
+  const layout = room.gameMode === '2v2' ? PLUS_SEAT_SIDES_2V2 : PLUS_SEAT_SIDES_FFA;
+  const eliminated = room.eliminated || new Set();
+  return layout.map(({ side, army, colorName }) => {
+    const pid = room.playerOrder[army] ?? null;
+    return {
+      side,
+      army,
+      colorName,
+      playerId: pid,
+      name: resolvePlayerDisplayName(room, pid, viewerId, army),
+      isYou: pid === viewerId,
+      isBot: pid ? isBotPlayerId(pid) : false,
+      eliminated: pid ? eliminated.has(pid) : false,
+    };
+  });
+}
+
 export function createRoom(hostId, opts = {}) {
   const code = Math.random().toString(36).substring(2, 8).toUpperCase();
   const gm = opts.gameMode || 'classic';
@@ -288,6 +331,7 @@ export function createRoom(hostId, opts = {}) {
   const room = {
     code,
     playerOrder: [hostId],
+    displayNames: Object.create(null),
     chess,
     deck,
     shuffles: { [hostId]: 0 },
@@ -1197,6 +1241,7 @@ export function publicState(room, viewerId) {
     },
     matchKind: room.matchType || 'private',
     gameMode: room.gameMode || 'classic',
+    plusSeats: buildPlusSeats(room, viewerId),
     mySeat: room.playerOrder.indexOf(viewerId),
     actionLog: (room.actionLog || []).slice(-60),
     liveRound:
