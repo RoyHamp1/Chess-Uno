@@ -12,6 +12,14 @@ import {
   FFA_W,
   FFA_H,
 } from './ffaEngine.js';
+import {
+  initDisconnectFields,
+  ensureRejoinToken,
+  ensureAllRejoinTokens,
+  buildDisconnectPublic,
+  rejoinTokenForViewer,
+  clearDisconnectGrace,
+} from './disconnectGrace.js';
 
 function isPlusChessMode(room) {
   return room.gameMode === 'ffa' || room.gameMode === '2v2';
@@ -361,7 +369,9 @@ export function createRoom(hostId, opts = {}) {
     lobbyReady: Object.create(null),
     botProfile: Object.create(null),
   };
+  initDisconnectFields(room);
   if (!isBotPlayerId(hostId)) room.lobbyReady[hostId] = false;
+  ensureRejoinToken(room, hostId);
   return room;
 }
 
@@ -391,6 +401,7 @@ export function startMatchFromLobby(room, opts = {}) {
   } else {
     room.eliminated = null;
   }
+  ensureAllRejoinTokens(room);
   return { ok: true };
 }
 
@@ -415,6 +426,7 @@ export function joinRoom(room, socketId, opts = {}) {
   if (!room.lobbyReady) room.lobbyReady = Object.create(null);
   if (!room.botProfile) room.botProfile = Object.create(null);
   if (!isBotPlayerId(socketId)) room.lobbyReady[socketId] = false;
+  ensureRejoinToken(room, socketId);
   if (autoStartIfFull && room.playerOrder.length === max) {
     startMatchFromLobby(room, { force: true });
   } else {
@@ -752,6 +764,7 @@ function computeGameResult(room) {
 
 export function votePlayAgain(room, socketId) {
   if (room.phase !== 'gameover') return { ok: false, error: 'Game is not over' };
+  if (room.playAgainDisabled) return { ok: false, error: 'Rematch is not available for this match' };
   if (!room.playerOrder.includes(socketId)) return { ok: false, error: 'Not in room' };
   room.playAgainVotes[socketId] = true;
   const votes = room.playerOrder.filter((id) => isBotPlayerId(id) || room.playAgainVotes[id]).length;
@@ -845,6 +858,8 @@ function resetMatch(room) {
   room.skipNextFor = null;
   room.gameResult = null;
   room.playAgainVotes = {};
+  room.playAgainDisabled = false;
+  clearDisconnectGrace(room);
   room.phase = 'playCard';
   room.activeSeat = room.playerOrder[0] || null;
   room.shuffles = {};
@@ -1125,7 +1140,7 @@ function appendClassicChessMoveLine(room, m) {
     line += ` (promotes to ${names[pr] || pr})`;
   }
   if (m.san) line += ` · ${m.san}`;
-  room.currentTurnLog.chessMoves.push({ line });
+  room.currentTurnLog.chessMoves.push({ line, from: m.from, to: m.to, piece: pt });
 }
 
 function appendFfaChessMoveLine(room, fromPiece, fr, fc, tr, tc) {
@@ -1134,7 +1149,12 @@ function appendFfaChessMoveLine(room, fromPiece, fr, fc, tr, tc) {
   const t = String(fromPiece.t || 'p').toLowerCase();
   const piece = names[t] || 'Piece';
   const line = `${piece} (${fr},${fc}) to (${tr},${tc})`;
-  room.currentTurnLog.chessMoves.push({ line });
+  room.currentTurnLog.chessMoves.push({
+    line,
+    from: `${fr},${fc}`,
+    to: `${tr},${tc}`,
+    piece: t,
+  });
 }
 
 function hostagesForPublic(room, viewerId) {
@@ -1238,7 +1258,10 @@ export function publicState(room, viewerId) {
       voted: room.playerOrder.filter((id) => isBotPlayerId(id) || room.playAgainVotes[id]).length,
       needed: room.playerOrder.length,
       iVoted: isBotPlayerId(viewerId) ? true : !!room.playAgainVotes[viewerId],
+      allowed: !room.playAgainDisabled,
     },
+    disconnect: buildDisconnectPublic(room),
+    rejoinToken: rejoinTokenForViewer(room, viewerId),
     matchKind: room.matchType || 'private',
     gameMode: room.gameMode || 'classic',
     plusSeats: buildPlusSeats(room, viewerId),

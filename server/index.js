@@ -32,9 +32,20 @@ import {
 } from './gameEngine.js';
 import { pickChessMove, pickFfaMove, pickBonusPayload } from './botAi.js';
 import { ffaLegalMoves, ffaPawnReachesPromotionEdge, FFA_W, FFA_H } from './ffaEngine.js';
+import {
+  beginDisconnectGrace,
+  acceptRejoin,
+  declineRejoin,
+  resolveDisconnectForfeit,
+  findRejoinEntry,
+  graceMatchesToken,
+  isMatchInProgress,
+} from './disconnectGrace.js';
 
 const PORT = process.env.PORT || 3001;
 const REVEAL_MS = 1100;
+const BOT_TURN_DELAY_MS = 320;
+const BOT_MOVE_DELAY_MS = 1500;
 
 const app = express();
 app.use(cors());
@@ -89,9 +100,16 @@ function trackPlayerDisplayName(room, socket) {
   room.displayNames[socket.id] = socket.data.username || 'Player';
 }
 
+function botActionDelay(room) {
+  if (!room.activeSeat || !isBotPlayerId(room.activeSeat)) return BOT_TURN_DELAY_MS;
+  if (room.phase === 'makingMoves') return BOT_MOVE_DELAY_MS;
+  if (room.phase === 'bonus' && room.bonus?.playerId === room.activeSeat) return BOT_MOVE_DELAY_MS;
+  return BOT_TURN_DELAY_MS;
+}
+
 function broadcastRoomWithRanked(room) {
   broadcastRoomWithRankedNoBot(room);
-  queueBotTurn(room.code);
+  queueBotTurn(room.code, botActionDelay(room));
 }
 
 function abandonKickMessage(room, pid) {
@@ -150,14 +168,33 @@ function disbandRoomAfterAbandon(io, room) {
   rooms.delete(code);
 }
 
-function queueBotTurn(code) {
+function queueBotTurn(code, delayMs = BOT_TURN_DELAY_MS) {
   setTimeout(() => {
     try {
       drainBotTurns(code);
     } catch (err) {
       console.error('drainBotTurns', err);
     }
-  }, 320);
+  }, delayMs);
+}
+
+function scheduleNextBotTurn(code, delayMs = BOT_TURN_DELAY_MS) {
+  const room = rooms.get(code);
+  if (
+    room &&
+    room.activeSeat &&
+    isBotPlayerId(room.activeSeat) &&
+    !room.pendingReveal &&
+    room.phase !== 'revealing'
+  ) {
+    queueBotTurn(code, delayMs);
+  }
+}
+
+function botContinuesSameTurn(room, botId) {
+  if (room.activeSeat !== botId) return false;
+  if (room.phase === 'makingMoves') return true;
+  return room.phase === 'bonus' && room.bonus?.playerId === botId;
 }
 
 function drainBotTurns(code) {
@@ -167,86 +204,68 @@ function drainBotTurns(code) {
   if (!head || !isBotPlayerId(head)) return;
   if (room.phase === 'revealing' || room.pendingReveal) return;
 
-  let spins = 0;
-  while (spins++ < 36) {
-    const cur = room.activeSeat;
-    if (!cur || !isBotPlayerId(cur)) break;
-    if (room.phase === 'revealing' || room.pendingReveal) break;
+  if (room.phase === 'playCard') {
+    const r = beginReveal(room, head);
+    if (!r.ok) return;
+    io.to(room.code).emit('cardReveal', {
+      card: { id: r.card.id, type: r.card.type, value: r.card.value, color: r.card.color },
+      playerId: head,
+    });
+    broadcastRoomWithRankedNoBot(room);
+    scheduleRevealCommit(room);
+    return;
+  }
 
-    if (room.phase === 'playCard') {
-      const r = beginReveal(room, cur);
-      if (!r.ok) break;
-      io.to(room.code).emit('cardReveal', {
-        card: { id: r.card.id, type: r.card.type, value: r.card.value, color: r.card.color },
-        playerId: cur,
-      });
-      broadcastRoomWithRankedNoBot(room);
-      scheduleRevealCommit(room);
+  if (room.phase === 'makingMoves') {
+    const diff = room.botProfile[head]?.difficulty || 'medium';
+    if (room.gameMode === 'ffa' || room.gameMode === '2v2') {
+      const st = { board: [...room.ffa.board], pawnMeta: { ...room.ffa.pawnMeta } };
+      const army = room.playerOrder.indexOf(head);
+      const teamMode = room.gameMode === '2v2' ? '2v2' : 'ffa';
+      const mv = pickFfaMove(
+        (s, fr, fc) => ffaLegalMoves(s, fr, fc, teamMode),
+        st,
+        army,
+        FFA_W,
+        FFA_H,
+        diff,
+      );
+      if (!mv) return;
+      const [tr, tc] = mv.to.split(',').map(Number);
+      const [fr, fc] = mv.from.split(',').map(Number);
+      const p = room.ffa.board[fr * FFA_W + fc];
+      let promotion;
+      if (p?.t?.toLowerCase() === 'p' && ffaPawnReachesPromotionEdge(army, tr, tc)) promotion = 'q';
+      const mr = makeChessMove(room, head, { ...mv, promotion });
+      if (!mr.ok) return;
+    } else {
+      const need = room.chess.turn();
+      const mv = pickChessMove(room.chess.fen(), need, diff);
+      if (!mv) return;
+      const mr = makeChessMove(room, head, mv);
+      if (!mr.ok) return;
+    }
+    broadcastRoomWithRankedNoBot(room);
+    if (room.phase === 'gameover') {
+      broadcastRoomWithRanked(room);
       return;
     }
-
-    if (room.phase === 'makingMoves') {
-      const diff = room.botProfile[cur]?.difficulty || 'medium';
-      if (room.gameMode === 'ffa' || room.gameMode === '2v2') {
-        const st = { board: [...room.ffa.board], pawnMeta: { ...room.ffa.pawnMeta } };
-        const army = room.playerOrder.indexOf(cur);
-        const teamMode = room.gameMode === '2v2' ? '2v2' : 'ffa';
-        const mv = pickFfaMove(
-          (s, fr, fc) => ffaLegalMoves(s, fr, fc, teamMode),
-          st,
-          army,
-          FFA_W,
-          FFA_H,
-          diff,
-        );
-        if (!mv) break;
-        const [tr, tc] = mv.to.split(',').map(Number);
-        const [fr, fc] = mv.from.split(',').map(Number);
-        const p = room.ffa.board[fr * FFA_W + fc];
-        let promotion;
-        if (p?.t?.toLowerCase() === 'p' && ffaPawnReachesPromotionEdge(army, tr, tc)) promotion = 'q';
-        const mr = makeChessMove(room, cur, { ...mv, promotion });
-        if (!mr.ok) break;
-      } else {
-        const need = room.chess.turn();
-        const mv = pickChessMove(room.chess.fen(), need, diff);
-        if (!mv) break;
-        const mr = makeChessMove(room, cur, mv);
-        if (!mr.ok) break;
-      }
-      broadcastRoomWithRankedNoBot(room);
-      if (room.phase === 'gameover') {
-        broadcastRoomWithRanked(room);
-        return;
-      }
-      continue;
-    }
-
-    if (room.phase === 'bonus' && room.bonus?.playerId === cur) {
-      const hint = bonusHint(room, cur);
-      const sqs = listBonusPawnSquares(room, cur);
-      if (!sqs.length) break;
-      const payload = pickBonusPayload(sqs, hint?.recoverableTypes);
-      let br = resolveBonus(room, cur, payload);
-      if (!br.ok) {
-        br = resolveBonus(room, cur, { action: 'pawn', square: sqs[0] });
-      }
-      if (!br.ok) break;
-      broadcastRoomWithRankedNoBot(room);
-      continue;
-    }
-
-    break;
+    scheduleNextBotTurn(code, botContinuesSameTurn(room, head) ? BOT_MOVE_DELAY_MS : BOT_TURN_DELAY_MS);
+    return;
   }
-  const r2 = rooms.get(code);
-  if (
-    r2 &&
-    r2.activeSeat &&
-    isBotPlayerId(r2.activeSeat) &&
-    !r2.pendingReveal &&
-    r2.phase !== 'revealing'
-  ) {
-    queueBotTurn(code);
+
+  if (room.phase === 'bonus' && room.bonus?.playerId === head) {
+    const hint = bonusHint(room, head);
+    const sqs = listBonusPawnSquares(room, head);
+    if (!sqs.length) return;
+    const payload = pickBonusPayload(sqs, hint?.recoverableTypes);
+    let br = resolveBonus(room, head, payload);
+    if (!br.ok) {
+      br = resolveBonus(room, head, { action: 'pawn', square: sqs[0] });
+    }
+    if (!br.ok) return;
+    broadcastRoomWithRankedNoBot(room);
+    scheduleNextBotTurn(code, botContinuesSameTurn(room, head) ? BOT_MOVE_DELAY_MS : BOT_TURN_DELAY_MS);
   }
 }
 
@@ -654,9 +673,90 @@ io.on('connection', (socket) => {
     broadcastRoomWithRanked(room);
   });
 
+  socket.on('checkRejoin', (payload) => {
+    const code = String(payload?.code || '')
+      .trim()
+      .toUpperCase();
+    const token = String(payload?.token || '').trim();
+    const room = code ? rooms.get(code) : null;
+    if (!room || !token) return;
+    const entry = findRejoinEntry(room, room.code, token);
+    if (!entry || !graceMatchesToken(room, token)) return;
+    const secondsLeft = Math.max(
+      0,
+      Math.ceil((room.disconnectGrace.deadline - Date.now()) / 1000),
+    );
+    socket.emit('rejoinOffer', { code: room.code, token, secondsLeft });
+  });
+
+  socket.on('rejoinMatch', (payload) => {
+    const code = String(payload?.code || '')
+      .trim()
+      .toUpperCase();
+    const token = String(payload?.token || '').trim();
+    const room = code ? rooms.get(code) : null;
+    if (!room || !token) {
+      socket.emit('toast', { type: 'error', message: 'Could not rejoin match' });
+      return;
+    }
+    const r = acceptRejoin(room, socket.id, room.code, token);
+    if (!r.ok) {
+      socket.emit('toast', { type: 'error', message: r.error || 'Could not rejoin' });
+      return;
+    }
+    trackPlayerDisplayName(room, socket);
+    socket.join(room.code);
+    socketRoom.set(socket.id, room.code);
+    socket.emit('toast', { type: 'ok', message: 'Rejoined match' });
+    broadcastRoomWithRanked(room);
+  });
+
+  socket.on('declineRejoin', (payload) => {
+    const code = String(payload?.code || '')
+      .trim()
+      .toUpperCase();
+    const token = String(payload?.token || '').trim();
+    const room = code ? rooms.get(code) : null;
+    if (!room || !token) return;
+    const r = declineRejoin(room, room.code, token);
+    if (!r.ok) {
+      socket.emit('toast', { type: 'error', message: r.error || 'Could not decline rejoin' });
+      return;
+    }
+    broadcastRoomWithRanked(room);
+  });
+
   socket.on('disconnect', () => {
     leaveQueues(socket.id);
     const code = socketRoom.get(socket.id);
+    const room = code ? rooms.get(code) : null;
+
+    if (room?.pendingReveal) {
+      clearRevealTimeout(room);
+      if (room.pendingReveal.playerId === socket.id) {
+        abortRevealIfDrawerLeft(room, socket.id);
+      } else {
+        commitPendingReveal(room);
+      }
+    }
+
+    if (room && isMatchInProgress(room) && !isBotPlayerId(socket.id)) {
+      beginDisconnectGrace(
+        room,
+        socket.id,
+        (r) => broadcastRoomWithRanked(r),
+        (r) => {
+          const leaver = r.disconnectGrace?.forfeitingId;
+          if (leaver) resolveDisconnectForfeit(r, leaver);
+          broadcastRoomWithRanked(r);
+        },
+      );
+      socket.leave(room.code);
+      socketRoom.delete(socket.id);
+      broadcastRoomWithRanked(room);
+      return;
+    }
+
     removeSocketFromRoom(socket);
     if (code) {
       const r = rooms.get(code);
